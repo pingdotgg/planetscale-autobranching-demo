@@ -1,4 +1,4 @@
-source .env.example
+source .env
 PLANETSCALE_DB=$DATABASE_NAME
 PLANETSCALE_BRANCH=$(git rev-parse --abbrev-ref HEAD | tr -cd '[:alnum:]-' | tr '[:upper:]' '[:lower:]')
 PLANETSCALE_STAGING_BRANCH=preview
