@@ -31,3 +31,5 @@ Locally, all you should ever have to do is run `pnpm dev`. This runs the [dev sc
 > As noted in the [dev script](./dev.sh), you could tunnel into the database using `pscale connect` to avoid creating new credentials everytime you start the development server. This however doesn't work with `database-js` out of the box.
 
 Later when you push your local changes up to GitHub, the [pscale-open workflow](.github/workflows/pscale-open.yaml) will run and check for schema changes as well. If it finds any, it will upsert a new database branch, create some PlanetScale credentials, and override the `DATABASE_USERNAME` and `DATABASE_PASSWORD` environment variables in the Vercel project for the current git branch (this is a super cool feature of Vercel btw). Then, it will trigger a redeploy so the new environment variables are used and the preview environment is connected to the new database branch.
+
+When pull requests are closed (merged or not), the database branch will be deleted (including all the credentials you've created for it), and the environment variable overrides will be removed from Vercel.
