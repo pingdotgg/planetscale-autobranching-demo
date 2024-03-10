@@ -1,0 +1,21 @@
+name: Setup Workflow
+description: Composite action that sets up pnpm and installs dependencies
+runs:
+  using: "composite"
+  steps:
+    - name: Use PNPM
+      uses: pnpm/action-setup@v2
+
+    - name: Use Node 18
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18.x
+        cache: "pnpm"
+
+    - name: Install dependencies
+      run: pnpm install
+      shell: bash
+
+    - name: Copy .env.example files
+      shell: bash
+      run: cp .env.example .env

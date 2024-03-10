@@ -1,4 +1,9 @@
-/** @type {import('next').NextConfig} */
-const nextConfig = {};
+import createJITI from 'jiti';
+import { fileURLToPath } from 'node:url';
 
-export default nextConfig;
+const jiti = createJITI(fileURLToPath(import.meta.url));
+jiti("./env");
+
+/** @type {import('next').NextConfig} */
+export default {};
+

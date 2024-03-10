@@ -1,0 +1,58 @@
+name: Reset Preview DB State
+
+on:
+  pull_request:
+    types: [closed]
+
+env:
+  PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+  PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+  PLANETSCALE_DB: ${{ secrets.PLANETSCALE_DATABASE_NAME }}
+  PLANETSCALE_ORG: ${{ secrets.PLANETSCALE_ORG }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  VERCEL_TEAM: ${{ secrets.VERCEL_TEAM }}
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+jobs:
+  delete-db-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Setup Node
+        uses: ./.github/setup
+      - name: Setup pscale
+        uses: planetscale/setup-pscale-action@v1
+
+      - name: Sanitize branch name to be PlanetScale compatible
+        id: sanitize_branch_name
+        run: echo "PSCALE_BRANCH_NAME=$(echo ${{ github.head_ref }} | tr -cd '[:alnum:]-'| tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Delete DB branches linked to this branch, will also remove passwords and close open DRs
+        run: |
+          set +e
+            pscale branch show ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }}
+            exit_code=$?
+          set -e
+
+          if [ $exit_code -eq 0 ]; then
+            echo "Branch exists. Deleting..."
+            pscale branch delete ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }} --force
+          else
+            echo "No branch exists for this PR. Skipping."
+          fi
+
+      - name: Remove Vercel env overrides
+        run: |
+          ids=$(
+            curl -s -X GET "https://api.vercel.com/v9/projects/${{ env.VERCEL_PROJECT_ID }}/env?gitBranch=${{ github.head_ref }}&teamId=${{ env.VERCEL_TEAM }}" \
+              -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" \
+            | jq -r '.envs[]
+            | select(.key == "DATABASE_USERNAME" or .key == "DATABASE_PASSWORD")
+            | .id'
+          );
+          for envId in $ids; do
+            curl -X DELETE "https://api.vercel.com/v9/projects/${{ env.VERCEL_PROJECT_ID }}/env/$envId?teamId=${{ env.VERCEL_TEAM }}" \
+              -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json"
+          done
+          echo "Deleted environment variable overrides"

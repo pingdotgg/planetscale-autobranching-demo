@@ -1,0 +1,199 @@
+name: Sync Preview DB State
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+env:
+  PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+  PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+  PLANETSCALE_DB: ${{ secrets.PLANETSCALE_DATABASE_NAME }}
+  PLANETSCALE_ORG: ${{ secrets.PLANETSCALE_ORG }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  VERCEL_TEAM: ${{ secrets.VERCEL_TEAM }}
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+  SCHEMA_PATH: src/db/schema.ts
+  PLANETSCALE_STAGING_BRANCH: preview
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 2
+      - name: Setup Node
+        uses: ./.github/setup
+      - name: Setup pscale
+        uses: planetscale/setup-pscale-action@v1
+
+      - name: Check if PR has schema changes
+        id: check_schema_changes
+        run: |
+          if git diff --quiet HEAD^..HEAD -- ${{ env.SCHEMA_PATH }}; then
+            echo "CHANGED=false" >> $GITHUB_OUTPUT
+          else
+            echo "CHANGED=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sanitize branch name to be PlanetScale compatible
+        id: sanitize_branch_name
+        run: echo "NAME=$(echo ${{ github.head_ref }} | tr -cd '[:alnum:]-'| tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Upsert a new branch on PlanetScale
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        id: create_branch
+        run: |
+          set +e
+            pscale branch show ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }}
+            exit_code=$?
+          set -e
+
+          if [ $exit_code -eq 0 ]; then
+            echo "Branch exists. Skipping branch creation."
+          else
+            echo "Branch ${{ steps.sanitize_branch_name.outputs.NAME }} does not exist. Creating..."
+            pscale branch create ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --wait --org ${{ env.PLANETSCALE_ORG }} --from ${{ env.PLANETSCALE_STAGING_BRANCH }}
+          fi
+
+      - name: Generate password for branch
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        run: |
+          data=$(pscale password create ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} gha-$(date +%s) --org ${{ env.PLANETSCALE_ORG }} -f json | tr -d '\n')
+          echo "USERNAME=$(echo "$data" | jq -r '.username')" >> $GITHUB_ENV
+          echo "PASSWORD=$(echo "$data" | jq -r '.plain_text')" >> $GITHUB_ENV
+
+      - name: Sync schema changes to the PR branch
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        run: |
+          export DATABASE_NAME=${{ env.PLANETSCALE_DB }}
+          export DATABASE_USERNAME=${{ env.USERNAME }}
+          export DATABASE_PASSWORD=${{ env.PASSWORD }}
+          pnpm db:push
+
+      - name: Update Vercel environment variables with new credentials
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        run: |
+          echo "Updating Vercel environment variables..."
+          curl -X POST "https://api.vercel.com/v10/projects/${{ env.VERCEL_PROJECT_ID }}/env?upsert=true&teamId=${{ env.VERCEL_TEAM }}" \
+            -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" \
+            -d '{
+              "gitBranch": "'"${{ github.head_ref }}"'",
+              "key": "DATABASE_USERNAME",
+              "target": ["preview"],
+              "type": "encrypted",
+              "value": "'"${{ env.USERNAME }}"'"
+            }'
+          curl -X POST "https://api.vercel.com/v10/projects/${{ env.VERCEL_PROJECT_ID }}/env?upsert=true&teamId=${{ env.VERCEL_TEAM }}" \
+            -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" \
+            -d '{
+              "gitBranch": "'"${{ github.head_ref }}"'",
+              "key": "DATABASE_PASSWORD",
+              "target": ["preview"],
+              "type": "encrypted",
+              "value": "'"${{ env.PASSWORD }}"'"
+            }'
+
+      - name: Trigger re-deployment to apply new environment variables
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        run: |
+          # Get the deployment ID for the current commit
+          DEPLOYMENT_ID=$(
+            curl -s -X GET "https://api.vercel.com/v6/deployments?projectId=${{ env.VERCEL_PROJECT_ID }}&target=preview&teamId=${{ env.VERCEL_TEAM }}" \
+              -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" |
+            jq -r ".deployments[] | select(.meta.githubCommitRef == \"${{ github.head_ref }}\") | .uid" | head -n 1
+          )
+          # Cancel the current deployment (doesn't have new envs)
+          curl -X PATCH "https://api.vercel.com/v12/deployments/$DEPLOYMENT_ID/cancel?teamId=${{ env.VERCEL_TEAM }}" \
+            -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json"
+          # Trigger a new deployment with the new envs
+          curl -X POST "https://api.vercel.com/v13/deployments?teamId=${{ env.VERCEL_TEAM }}" \
+            -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" \
+            -d '{
+            "name": "my-instant-deployment",
+            "deploymentId": "'"$DEPLOYMENT_ID"'"
+          }'
+
+      - name: Create a deploy request on PlanetScale
+        if: steps.check_schema_changes.outputs.CHANGED == 'true'
+        id: create_deploy_request
+        run: |
+          set +e
+            response=$(pscale deploy-request show ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }} -f json)
+            exit_code=$?
+            deploy_request_number=$(echo "$response" | jq -r '.number')
+            state=$(echo "$response" | jq -r '.state')
+            if [ $exit_code -eq 0 ] && [ "$state" = "open" ]; then has_open_dr=1; else has_open_dr=0; fi
+          set -e
+          set +e
+            response=$(pscale deploy-request show ${{ env.PLANETSCALE_DB }} ${{ env.PLANETSCALE_STAGING_BRANCH }} --org ${{ env.PLANETSCALE_ORG }} -f json)
+            prod_deploy_request_number=$(echo "$response" | jq -r '.number')
+          set -e
+
+          if [ $has_open_dr == 1 ]; then
+            echo "Deploy request already exists. Skipping creation."
+          else
+            echo "Creating deploy request..."
+            deploy_request_number=$(pscale deploy-request create ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }} -f json | jq -r '.number')
+            if [ $prod_deploy_request_number == "null" ]; then
+              prod_deploy_request_number=$(pscale deploy-request create ${{ env.PLANETSCALE_DB }} ${{ env.PLANETSCALE_STAGING_BRANCH }} --org ${{ env.PLANETSCALE_ORG }} -f json | jq -r '.number')
+            fi
+            sleep 3
+          fi
+
+          echo "<!-- DR_DIFF -->" >> dr-diff.txt
+          echo "# REQUIRES DR" >> dr-diff.txt
+          echo "- [ ] [PREVIEW](https://app.planetscale.com/${{ env.PLANETSCALE_ORG }}/${{ env.PLANETSCALE_DB }}/deploy-requests/$deploy_request_number)" >> dr-diff.txt
+          echo "- [ ] [PROD](https://app.planetscale.com/${{ env.PLANETSCALE_ORG }}/${{ env.PLANETSCALE_DB }}/deploy-requests/$prod_deploy_request_number)" >> dr-diff.txt
+          echo "" >> dr-diff.txt
+          echo "<details>" >> dr-diff.txt
+          echo "  <summary>Schema changes</summary>" >> dr-diff.txt
+          echo "" >> dr-diff.txt
+          echo "\`\`\`diff" >> dr-diff.txt
+          pscale deploy-request diff ${{ env.PLANETSCALE_DB }} $deploy_request_number --org ${{ env.PLANETSCALE_ORG }} -f json | jq -r '.[].raw' >> dr-diff.txt
+          echo "\`\`\`" >> dr-diff.txt
+          echo "</details>" >> dr-diff.txt
+          echo "" >> dr-diff.txt
+          echo "<!-- END_DR_DIFF -->" >> dr-diff.txt
+
+      # Reset the state if the PR had schema changes but then they were removed
+      - name: Remove Vercel env overrides
+        if: steps.check_schema_changes.outputs.CHANGED == 'false'
+        run: |
+          echo "Removing potential overrides..."
+          ids=$(
+            curl -s -X GET "https://api.vercel.com/v9/projects/${{ env.VERCEL_PROJECT_ID }}/env?gitBranch=${{ github.head_ref }}&teamId=${{ env.VERCEL_TEAM }}" \
+              -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json" \
+            | jq -r '.envs[]
+            | select(.key == "DATABASE_USERNAME" or .key == "DATABASE_PASSWORD")
+            | .id'
+          );
+          for envId in $ids; do
+            curl -X DELETE "https://api.vercel.com/v9/projects/${{ env.VERCEL_PROJECT_ID }}/env/$envId?teamId=${{ env.VERCEL_TEAM }}" \
+              -H "Authorization: Bearer ${{ env.VERCEL_TOKEN }}" -H "Content-Type: application/json"
+          done
+          echo "Deleted environment variable overrides"
+
+      # Reset the state if the PR had schema changes but then they were removed
+      - name: Delete PlanetScale branch
+        if: steps.check_schema_changes.outputs.CHANGED == 'false'
+        run: |
+          echo "No schema changes detected. Deleting branch..."
+          set +e
+            pscale branch delete ${{ env.PLANETSCALE_DB }} ${{ steps.sanitize_branch_name.outputs.NAME }} --org ${{ env.PLANETSCALE_ORG }} --force
+          set -e
+          echo "<!-- DR_DIFF -->" >> dr-diff.txt
+          echo "# NO DR REQUIRED" >> dr-diff.txt
+          echo "" >> dr-diff.txt
+          echo "<!-- END_DR_DIFF -->" >> dr-diff.txt
+
+      - name: Update PR description with DR link and diff
+        uses: nefrob/pr-description@v1.1.1
+        with:
+          content: dr-diff.txt
+          regex: "<!-- DR_DIFF -->.*?<!-- END_DR_DIFF -->"
+          regexFlags: ims
+          contentIsFilePath: true
+          token: ${{ secrets.GITHUB_TOKEN }}
