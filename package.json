@@ -5,7 +5,7 @@
   "packageManager": "pnpm@8.15.4",
   "scripts": {
     "db:push": "drizzle-kit push:mysql --config db/config.ts",
-    "dev": "next dev",
+    "dev": "./dev.sh",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
