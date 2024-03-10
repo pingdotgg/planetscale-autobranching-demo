@@ -18,6 +18,7 @@ The following secrets need to be set in the Github repository:
 
 - PlanetScale CLI: https://planetscale.com/features/cli
 - Some fairly standard command-line tools: `jq`, `tr`
+- Credentials for your staging branch in `.env` (or whatever other branch you use for development when there are no schema changes)
 
 ## Background
 
