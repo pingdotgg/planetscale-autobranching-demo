@@ -14,7 +14,7 @@ env:
   VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
   SCHEMA_PATH: src/db/schema.ts
-  PLANETSCALE_STAGING_BRANCH: preview
+  PLANETSCALE_STAGING_BRANCH: preview # The branch to use as a base for new branches
 
 jobs:
   create-branch:
